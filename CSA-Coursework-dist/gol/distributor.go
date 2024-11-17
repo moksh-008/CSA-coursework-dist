@@ -1,18 +1,13 @@
 package gol
 
 import (
-	"flag"
 	"fmt"
+	"log"
 	"net/rpc"
-	"sync"
+	"strconv"
 	"time"
-
-	"uk.ac.bris.cs/gameoflife/util"
-
 	"uk.ac.bris.cs/gameoflife/stubs"
 )
-
-var serverAddress = flag.String("server", "127.0.0.1:8030", "IP:port string to connect to as server")
 
 type distributorChannels struct {
 	events     chan<- Event
@@ -26,154 +21,158 @@ type distributorChannels struct {
 
 // distributor divides the work between workers and interacts with other goroutines.
 func distributor(p Params, c distributorChannels) {
-	flag.Parse()
-
-	// Initialize and load the initial world state
+	// Initialize a 2D slice to store the world.
 	world := make([][]byte, p.ImageHeight)
 	for i := range world {
 		world[i] = make([]byte, p.ImageWidth)
 	}
 
-	filename := fmt.Sprintf("%dx%d", p.ImageHeight, p.ImageWidth)
+	file := strconv.Itoa(p.ImageWidth)
+	file = file + "x" + file
 	c.ioCommand <- ioInput
-	c.ioFilename <- filename
-	for y := 0; y < p.ImageHeight; y++ {
-		for x := 0; x < p.ImageWidth; x++ {
+	c.ioFilename <- file
+
+	// Populate the world with data read from the input PGM file.
+	for y := range world {
+		for x := range world[y] {
 			world[y][x] = <-c.ioInput
 		}
 	}
 
-	// Initial debug statement for verification
-	initialAliveCount := countAliveCells(world)
-	fmt.Println("Initial Alive Cell Count:", initialAliveCount)
+	turn := 0
+	c.events <- StateChange{turn, Executing}
 
-	// Return if Turns == 0
-	if p.Turns == 0 {
-		sendFinalOutput(world, p, c)
-		return
-	}
-
-	client, err := rpc.Dial("tcp", *serverAddress)
+	// Connect to the Game of Life server over RPC.
+	client, err := rpc.Dial("tcp", "34.228.70.171:8030")
 	if err != nil {
 		fmt.Println("Error connecting to server:", err)
 		return
 	}
 	defer client.Close()
 
-	// Prepare the RPC request to send for each turn
+	// Prepare a request to send to the server with the initial world state and parameters.
 	request := stubs.Request{
-		World:       world,
-		ImageHeight: p.ImageHeight,
-		ImageWidth:  p.ImageWidth,
-		Turns:       1, // Single turn processing at a time
+		InitialWorld: world,
+		ImageWidth:   p.ImageWidth,
+		ImageHeight:  p.ImageHeight,
+		Turns:        p.Turns,
 	}
-	var response stubs.Response
 
-	// Ticker for every 2 seconds reporting alive cell count
+	// Set up a ticker to call the `Alive` method every 2 seconds.
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
+
+	// Channel to signal when the simulation is complete.
 	done := make(chan bool)
 
-	var mutex sync.Mutex
+	// Start a goroutine for periodic alive cell count requests.
 	go func() {
+
 		for {
 			select {
 			case <-ticker.C:
-				response := new(stubs.Response)
-				mutex.Lock()
-				client.Call(stubs.AliveCellReport, request, response)
-				c.events <- AliveCellsCount{response.CompletedTurns, len(response.AliveCells)}
-				mutex.Unlock()
+
+				aliveResponse := new(stubs.AliveResponse)
+				aliveRequest := stubs.AliveRequest{ImageHeight: p.ImageHeight, ImageWidth: p.ImageWidth}
+				err := client.Call(stubs.AliveCellReport, aliveRequest, aliveResponse)
+				if err != nil {
+					fmt.Println("Error in Alive RPC call:", err)
+					continue
+				}
+				// Emit an AliveCellsCount event with the current alive cell count.
+				c.events <- AliveCellsCount{
+					CompletedTurns: aliveResponse.Turn,
+					CellsCount:     aliveResponse.AliveCellsCount,
+				}
 			case <-done:
 				return
-
 			}
-
 		}
 	}()
-	//go func() {
-	//	for {
-	//		select {
-	//		case key := <-c.ioKeypress:
-	//			switch key {
-	//			case 's':
-	//				response := new(stubs.Response)
-	//				err := client.Call(stubs.KeyPressHandler, stubs.KeyPress{Key: 's'}, response)
-	//				if err == nil {
-	//					savePgmFile(c, world, p.ImageWidth, p.ImageHeight, response.CompletedTurns)
-	//				}
-	//			case 'q':
-	//				response := new(stubs.Response)
-	//				err := client.Call(stubs.KeyPressHandler, stubs.KeyPress{Key: 'q'}, response)
-	//				if err == nil {
-	//					sendFinalOutput(world, p, c)
-	//					c.events <- StateChange{CompletedTurns: response.CompletedTurns, NewState: Quitting}
-	//				}
-	//				return
-	//			case 'k':
-	//				response := new(stubs.Response)
-	//				err := client.Call(stubs.KeyPressHandler, stubs.KeyPress{Key: 'k'}, response)
-	//				if err == nil {
-	//					savePgmFile(c, world, p.ImageWidth, p.ImageHeight, response.CompletedTurns)
-	//				}
-	//				client.Call(stubs.ShutDownHandler, stubs.Request{}, new(stubs.Response))
-	//				return
-	//			case 'p':
-	//				response := new(stubs.Response)
-	//				err := client.Call(stubs.KeyPressHandler, stubs.KeyPress{Key: 'p'}, response)
-	//				if err == nil {
-	//					if response.NewState == stubs.Paused {
-	//						fmt.Println("Paused at turn:", response.CompletedTurns)
-	//					} else {
-	//						fmt.Println("Continuing")
-	//					}
-	//				}
-	//			}
-	//		}
-	//	}
-	//}()
-
-	// Process each turn individually
-
-	request.World = world
-	err = client.Call(stubs.ServerHandler, request, &response)
+	go func() {
+		for {
+			select {
+			case command := <-c.ioKeypress:
+				keyRequest := stubs.KeyRequest{command}
+				keyResponse := new(stubs.KeyResponse)
+				err := client.Call(stubs.KeyPresshandler, keyRequest, keyResponse)
+				if err != nil {
+					log.Fatal("Key Press Call Error:", err)
+				}
+				outFileName := file + "x" + strconv.Itoa(keyResponse.Turns)
+				switch command {
+				case 's':
+					c.events <- StateChange{keyResponse.Turns, Executing}
+					savePGMImage(c, keyResponse.World, outFileName, p.ImageHeight, p.ImageWidth)
+				case 'k':
+					err := client.Call(stubs.KillServerHandler, stubs.KillRequest{}, new(stubs.KillResponse))
+					savePGMImage(c, keyResponse.World, outFileName, p.ImageHeight, p.ImageWidth)
+					c.events <- StateChange{keyResponse.Turns, Quitting}
+					if err != nil {
+						log.Fatal("Kill Request Call Error:", err)
+					}
+					done <- true
+				case 'q':
+					c.events <- StateChange{keyResponse.Turns, Quitting}
+					done <- true
+				case 'p':
+					paused := true
+					fmt.Println(keyResponse.Turns)
+					c.events <- StateChange{keyResponse.Turns, Paused}
+					for paused == true {
+						command := <-c.ioKeypress
+						switch command {
+						case 'p':
+							keyRequest := stubs.KeyRequest{command}
+							keyResponse := new(stubs.KeyResponse)
+							client.Call(stubs.KeyPresshandler, keyRequest, keyResponse)
+							c.events <- StateChange{keyResponse.Turns, Executing}
+							fmt.Println("Continuing")
+							paused = false
+						}
+					}
+				}
+			}
+		}
+	}()
+	// Make the RPC call to the server's Game of Life handler to start the simulation.
+	err = client.Call(stubs.ServerHandler, request, &stubs.Response{})
 	if err != nil {
-		fmt.Println("Error in RPC call:", err)
-		done <- true
+		fmt.Println("Error in GOL RPC call:", err)
 		return
 	}
-	// Process interim alive cell counts
-	for _, aliveCount := range response.InterimAliveCounts {
-		c.events <- AliveCellsCount{CompletedTurns: aliveCount.Turn, CellsCount: aliveCount.AliveCells}
-	}
-	// Update the world state after each turn
-	world = response.FinalStateWorld
-	finalAliveCount := countAliveCells(world)
-	c.events <- AliveCellsCount{CompletedTurns: p.Turns, CellsCount: finalAliveCount}
 
-	// Send the final output stateboard as a PGM file
-	sendFinalOutput(world, p, c)
+	// Wait until the simulation completes.
+	// Since the GOL RPC call returns immediately, we need another way to determine completion.
+	// For simplicity, we'll wait for the number of turns multiplied by the delay per turn.
+	// Alternatively, implement a mechanism to detect simulation completion via additional RPC or shared state.
+	simulationDuration := time.Duration(p.Turns) * 1 * time.Second
+	time.Sleep(simulationDuration)
+
+	// After simulation completes, request the final world state.
+	finalResponse := new(stubs.Response)
+	err = client.Call(stubs.ServerHandler, request, finalResponse)
+	if err != nil {
+		fmt.Println("Error fetching final state:", err)
+		return
+	}
+
+	// Send the final world state and list of alive cells to the events channel.
+	c.events <- FinalTurnComplete{
+		CompletedTurns: finalResponse.CompletedTurns,
+		Alive:          finalResponse.AliveCellsAfterFinalState,
+	}
+
+	// Output the final world state to a PGM file.
+	outputPGM(p, c, finalResponse.FinalWorld, finalResponse.CompletedTurns)
+
+	// Signal that the simulation is complete.
 	done <- true
+
 }
 
-func savePgmFile(c distributorChannels, world [][]byte, imageWidth, imageHeight, turn int) {
-	c.ioCommand <- ioOutput
-	c.ioFilename <- fmt.Sprintf("%dx%dx%d", imageWidth, imageHeight, turn) // taken from test go file
-	for y := 0; y < imageHeight; y++ {
-		for x := 0; x < imageWidth; x++ {
-			c.ioOutput <- world[y][x] // send pixel data to output channel
-		}
-	}
-
-	// Make sure to wait for I/O to finish before signaling completion
-	c.ioCommand <- ioCheckIdle
-	<-c.ioIdle
-
-	c.events <- ImageOutputComplete{turn, fmt.Sprintf("%dx%dx%d", imageWidth, imageHeight, turn)}
-}
-
-// Helper function to send the final state and events after all turns are complete
-func sendFinalOutput(world [][]byte, p Params, c distributorChannels) {
+// outputPGM saves the final world state to a PGM file.
+func outputPGM(p Params, c distributorChannels, world [][]byte, completedTurns int) {
 	// Output the final state to IO channels
 	c.ioCommand <- ioOutput
 	outputFilename := fmt.Sprintf("%dx%dx%d", p.ImageHeight, p.ImageWidth, p.Turns)
@@ -184,39 +183,18 @@ func sendFinalOutput(world [][]byte, p Params, c distributorChannels) {
 		}
 	}
 
-	// Send final events after completion
-	aliveCells := getAliveCells(world)
-	c.events <- FinalTurnComplete{CompletedTurns: p.Turns, Alive: aliveCells}
-	c.events <- StateChange{CompletedTurns: p.Turns, NewState: Quitting}
-
 	// Ensure IO has completed any pending tasks before quitting
 	c.ioCommand <- ioCheckIdle
 	<-c.ioIdle
+	c.events <- StateChange{completedTurns, Quitting}
 	close(c.events)
 }
-
-// Helper function to count alive cells in the world
-func countAliveCells(world [][]byte) int {
-	aliveCount := 0
-	for _, row := range world {
-		for _, cell := range row {
-			if cell == 255 {
-				aliveCount++
-			}
+func savePGMImage(c distributorChannels, w [][]byte, file string, imageHeight, imageWidth int) {
+	c.ioCommand <- ioOutput
+	c.ioFilename <- file
+	for y := 0; y < imageHeight; y++ {
+		for x := 0; x < imageWidth; x++ {
+			c.ioOutput <- w[y][x]
 		}
 	}
-	return aliveCount
-}
-
-// Helper function to get a list of alive cell coordinates in the world
-func getAliveCells(world [][]byte) []util.Cell {
-	aliveCells := []util.Cell{}
-	for y, row := range world {
-		for x, cell := range row {
-			if cell == 255 {
-				aliveCells = append(aliveCells, util.Cell{X: x, Y: y})
-			}
-		}
-	}
-	return aliveCells
 }

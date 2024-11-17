@@ -1,3 +1,4 @@
+// server.go
 package main
 
 import (
@@ -12,131 +13,198 @@ import (
 	"uk.ac.bris.cs/gameoflife/util"
 )
 
-var mutex sync.Mutex
+var (
+	GolWorld [][]byte
+	GolTurn  int
+	Pause    string = "Continue"
+	Quit     string = "No"
+	Close    string = "No"
+	mu       sync.Mutex
+	KillChan = make(chan bool)
+)
 
-// Helper function to calculate the next state of the world.
-func calculateNextState(imageHeight, imageWidth int, world [][]uint8) [][]uint8 {
-	newWorld := make([][]uint8, imageHeight)
+// Initializes a new empty world of the specified height and width.
+func makeWorld(height int, width int) [][]byte {
+	world := make([][]byte, height)
+	for i := range world {
+		world[i] = make([]byte, width)
+	}
+	return world
+}
+
+// GameOfLifeOperations struct that serves the RPC methods
+type GameOfLifeOperations struct {
+	isPaused bool
+	Mu       sync.Mutex
+	World    [][]byte
+	Turns    int
+	Quit     bool
+	Paused   bool
+	Workers  []*rpc.Client
+}
+
+// GOL processes the Game of Life evolution for the specified number of turns.
+func (s *GameOfLifeOperations) GOL(req stubs.Request, res *stubs.Response) (err error) {
+
+	// Initialize the global world and turn state
+	GolWorld = req.InitialWorld
+	height := req.ImageHeight
+	width := req.ImageWidth
+	turns := req.Turns
+
+	// Process each turn, evolving the world state
+	for t := 0; t < turns; t++ {
+		// Check for quit signal
+		if Quit == "Yes" {
+			fmt.Println("Received quit signal. Ending simulation.")
+			break
+		}
+
+		mu.Lock()
+		GolWorld = executeTurn(GolWorld, height, width)
+		GolTurn = t + 1 // Update the global turn count
+		mu.Unlock()
+
+		// Check for pause condition
+		for Pause == "Pause" {
+			time.Sleep(1 * time.Second)
+		}
+	}
+
+	// Populate the response with the final world state and alive cells after final state
+	res.FinalWorld = GolWorld
+	res.CompletedTurns = GolTurn
+	res.AliveCellsAfterFinalState = findAliveCells(GolWorld)
+
+	return
+}
+
+// Alive provides the count of currently alive cells and the current turn
+func (s *GameOfLifeOperations) Alive(req stubs.AliveRequest, res *stubs.AliveResponse) (err error) {
+
+	// Wait if the game is paused
+	for Pause == "Pause" {
+		time.Sleep(1 * time.Second)
+	}
+
+	// Calculate the alive cells based on the current world state
+	mu.Lock()
+	res.Turn = GolTurn
+	res.AliveCellsCount = countAliveCells(GolWorld)
+	mu.Unlock()
+	return
+}
+
+func (s *GameOfLifeOperations) KillServer(req stubs.KillRequest, res *stubs.KillResponse) (err error) {
+	KillChan <- true
+	return
+}
+
+func (s *GameOfLifeOperations) PressedKey(req stubs.KeyRequest, res *stubs.KeyResponse) (err error) {
+
+	res.Turns = GolTurn
+	res.World = GolWorld
+	switch req.Key {
+	case 'p':
+		if s.Paused == false {
+			s.Paused = true
+		} else {
+			s.Paused = false
+		}
+	case 'q':
+		s.Quit = true
+	case 'k':
+		s.Quit = true
+	}
+	return
+}
+
+// executeTurn performs a single evolution of the Game of Life
+func executeTurn(world [][]byte, height, width int) [][]byte {
+	newWorld := make([][]byte, height)
 	for i := range newWorld {
-		newWorld[i] = make([]uint8, imageWidth)
+		newWorld[i] = make([]byte, width)
 	}
 
-	countAliveNeighbors := func(x, y int) int {
-		liveNeighbors := 0
-		for dx := -1; dx <= 1; dx++ {
-			for dy := -1; dy <= 1; dy++ {
-				if dx == 0 && dy == 0 {
-					continue
-				}
-				nx, ny := (x+dx+imageWidth)%imageWidth, (y+dy+imageHeight)%imageHeight
-				if world[ny][nx] == 255 {
-					liveNeighbors++
-				}
-			}
-		}
-		return liveNeighbors
-	}
-
-	for y := 0; y < imageHeight; y++ {
-		for x := 0; x < imageWidth; x++ {
-			aliveNeighbors := countAliveNeighbors(x, y)
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			aliveNeighbors := countAliveNeighbors(world, x, y, height, width)
 			currentCell := world[y][x]
-			if currentCell == 255 && (aliveNeighbors == 2 || aliveNeighbors == 3) {
-				newWorld[y][x] = 255
-			} else if currentCell == 0 && aliveNeighbors == 3 {
-				newWorld[y][x] = 255
+
+			// Apply Game of Life rules
+			if currentCell == 255 {
+				// Cell is currently alive
+				if aliveNeighbors < 2 || aliveNeighbors > 3 {
+					newWorld[y][x] = 0 // Dies
+				} else {
+					newWorld[y][x] = 255 // Stays alive
+				}
 			} else {
-				newWorld[y][x] = 0
+				// Cell is currently dead
+				if aliveNeighbors == 3 {
+					newWorld[y][x] = 255 // Becomes alive
+				} else {
+					newWorld[y][x] = 0 // Stays dead
+				}
 			}
 		}
 	}
+
 	return newWorld
 }
 
-// Helper function to get the list of alive cells.
-func getAliveCells(world [][]uint8) []util.Cell {
-	var aliveCells []util.Cell
+// countAliveNeighbors counts alive neighbors for a cell at (x, y)
+func countAliveNeighbors(world [][]byte, x, y, height, width int) int {
+	liveNeighbors := 0
+	for dy := -1; dy <= 1; dy++ {
+		for dx := -1; dx <= 1; dx++ {
+			if dx == 0 && dy == 0 {
+				continue // Skip the cell itself
+			}
+			neighborY := (y + dy + height) % height
+			neighborX := (x + dx + width) % width
+			if world[neighborY][neighborX] == 255 {
+				liveNeighbors++
+			}
+		}
+	}
+	return liveNeighbors
+}
+
+// countAliveCells counts the number of alive cells in the world
+func countAliveCells(world [][]byte) int {
+	aliveCount := 0
 	for y := 0; y < len(world); y++ {
 		for x := 0; x < len(world[y]); x++ {
-			if world[y][x] == 255 {
-				aliveCells = append(aliveCells, util.Cell{X: x, Y: y})
+			if world[y][x] == 255 { // Alive cell
+				aliveCount++
+			}
+		}
+	}
+	return aliveCount
+}
+
+// findAliveCells collects the coordinates of all live cells in the world
+func findAliveCells(world [][]byte) []util.Cell {
+	aliveCells := []util.Cell{}
+	for y := 0; y < len(world); y++ {
+		for x := 0; x < len(world[y]); x++ {
+			if world[y][x] == 255 { // Alive cell
+				aliveCells = append(aliveCells, util.Cell{Y: y, X: x})
 			}
 		}
 	}
 	return aliveCells
 }
 
-type GameOfLifeServerOperations struct {
-	world       [][]uint8
-	imageHeight int
-	imageWidth  int
-	mutex       sync.Mutex
-}
-
-// GOL performs the Game of Life calculations over the specified number of turns.
-func (s *GameOfLifeServerOperations) GOL(req stubs.Request, res *stubs.Response) (err error) {
-	imageHeight := req.ImageHeight
-	imageWidth := req.ImageWidth
-	turns := req.Turns
-	world := req.World
-
-	// Initialize InterimAliveCounts with the number of turns
-	res.InterimAliveCounts = make([]stubs.AliveCount, turns)
-
-	// Process each turn and update the response
-	for turn := 0; turn < turns; turn++ {
-		world = calculateNextState(imageHeight, imageWidth, world)
-
-		// Store alive cell count for the current turn
-		aliveCount := len(getAliveCells(world))
-		res.InterimAliveCounts[turn] = stubs.AliveCount{
-			Turn:       turn + 1,
-			AliveCells: aliveCount,
-		}
-
-		fmt.Printf("Turn %d: %d alive cells\n", turn+1, aliveCount)
-	}
-
-	// Set the final state in response
-	res.FinalStateWorld = world
-	res.AliveCells = getAliveCells(world)
-	return
-}
-
-// reportAliveCells periodically reports the number of alive cells.
-func (g *GameOfLifeServerOperations) AliveCells(req stubs.Request, res *stubs.Response) (err error) {
-	mutex.Lock()
-	aliveCells := getAliveCells(req.World)
-	res.AliveCells = aliveCells
-	res.CompletedTurns = req.Turns
-	mutex.Unlock()
-	return
-}
-
 func main() {
+	// Initialize the Game of Life RPC server
 	pAddr := flag.String("port", "8030", "Port to listen on")
 	flag.Parse()
 	rand.Seed(time.Now().UnixNano())
-
-	// Register the Game of Life server operations with RPC
-	server := &GameOfLifeServerOperations{}
-	err := rpc.Register(server)
-	if err != nil {
-		return
-	}
-
-	listener, err := net.Listen("tcp", ":"+*pAddr)
-	if err != nil {
-		fmt.Println("Error starting server:", err)
-		return
-	}
-	defer func(listener net.Listener) {
-		err := listener.Close()
-		if err != nil {
-
-		}
-	}(listener)
-	fmt.Println("Game of Life server started on port", *pAddr)
-
+	rpc.Register(&GameOfLifeOperations{})
+	listener, _ := net.Listen("tcp", ":"+*pAddr)
+	defer listener.Close()
+	fmt.Println("Server started on port", *pAddr)
 	rpc.Accept(listener)
 }

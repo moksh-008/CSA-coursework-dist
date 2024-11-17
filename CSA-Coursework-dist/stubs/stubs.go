@@ -1,41 +1,71 @@
+// stubs.go
 package stubs
 
 import "uk.ac.bris.cs/gameoflife/util"
 
-var ServerHandler = "GameOfLifeServerOperations.GOL"
-var AliveCellReport = "GameOfLifeServerOperations.AliveCells"
-var KeyPressHandler = "GameOfLifeServerOperations.KeyPressHandler"
-var ShutDownHandler = "GameOfLifeServer.ShutDown"
+// RPC method names
+var ServerHandler = "GameOfLifeOperations.GOL"
+var AliveCellReport = "GameOfLifeOperations.Alive"
+var KeyPresshandler = "GameOfLifeOperations.PressedKey"
+var KillServerHandler = "GOLOperations.KillServer"
 
-type GameState int
+const (
+	Paused    = "Paused"
+	Executing = "Executing"
+	Quitting  = "Quitting"
+)
 
-//const (
-//	Executing GameState = iota
-//	Paused
-//	Quitting
-//)
+// Empty request and response for simple RPC calls
+type EmptyRequest struct{}
+type EmptyResponse struct{}
 
-type AliveCount struct {
-	Turn       int
-	AliveCells int
+// WorldState represents the current state of the Game of Life world
+type WorldState struct {
+	World [][]byte
 }
 
+// PauseResumeRequest represents a request to pause or resume the simulation
+type PauseResumeRequest struct {
+	Pause bool
+}
+
+// Response represents the response structure for the Game of Life evolution result
 type Response struct {
-	FinalStateWorld    [][]uint8
-	AliveCells         []util.Cell
-	CompletedTurns     int
-	AliveCellCount     int
-	NewState           GameState
-	InterimAliveCounts []AliveCount
+	FinalWorld                [][]byte    // Final world state after evolution
+	CompletedTurns            int         // Number of turns completed
+	AliveCellsAfterFinalState []util.Cell // Number of alive cells after the final state
+	NewState                  string
 }
 
+// Request represents the request structure for initializing the Game of Life simulation
 type Request struct {
-	World       [][]uint8
-	NewWorld    [][]uint8
-	ImageHeight int
-	ImageWidth  int
-	Turns       int
+	InitialWorld [][]byte // Initial state of the world grid
+	ImageHeight  int      // Height of the world grid
+	ImageWidth   int      // Width of the world grid
+	Turns        int      // Number of turns to process
 }
-type KeyPress struct {
+
+// AliveResponse represents the response for the current alive cell count and turn number
+type AliveResponse struct {
+	AliveCellsCount int // Count of currently alive cells
+	Turn            int // Current turn number
+}
+
+// AliveRequest represents a request to retrieve the current alive cell count
+type AliveRequest struct {
+	ImageHeight int // Height of the world grid (used if needed)
+	ImageWidth  int // Width of the world grid (used if needed)
+}
+
+type KeyResponse struct {
+	World [][]byte
+	Turns int
+}
+
+type KillRequest struct {
+}
+type KeyRequest struct {
 	Key rune
+}
+type KillResponse struct {
 }
