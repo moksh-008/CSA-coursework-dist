@@ -43,7 +43,7 @@ func distributor(p Params, c distributorChannels) {
 	c.events <- StateChange{turn, Executing}
 
 	// Connect to the Game of Life server over RPC.
-	client, err := rpc.Dial("tcp", "34.228.70.171:8030")
+	client, err := rpc.Dial("tcp", ":8030")
 	if err != nil {
 		fmt.Println("Error connecting to server:", err)
 		return
